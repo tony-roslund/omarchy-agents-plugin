@@ -1,0 +1,68 @@
+#!/bin/bash
+# Run packaged collectors, then the Grok collector shipped with this clone.
+# omarchy-agent-usage-update only globs $OMARCHY_PATH/bin, so a cloned plugin
+# has to write grok.json itself.
+
+set -u
+
+PLUGIN_DIR=$(cd "$(dirname "$0")" && pwd)
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+mkdir -p "$USAGE_DIR"
+
+flags=()
+only=()
+except_grok=0
+except_next=0
+for arg in "$@"; do
+  if [[ $except_next -eq 1 ]]; then
+    except_next=0
+    [[ $arg == grok ]] && except_grok=1
+    continue
+  fi
+  case "$arg" in
+    --force | --limits-only) flags+=("$arg") ;;
+    --except) except_next=1 ;;
+    grok) only+=("grok") ;;
+    *)
+      if [[ $arg != --* ]]; then
+        only+=("$arg")
+      fi
+      ;;
+  esac
+done
+
+want_grok=1
+if ((${#only[@]} > 0)); then
+  want_grok=0
+  for agent in "${only[@]}"; do
+    [[ $agent == grok ]] && want_grok=1
+  done
+fi
+((except_grok)) && want_grok=0
+
+run_packaged=1
+if ((${#only[@]} > 0)); then
+  run_packaged=0
+  for agent in "${only[@]}"; do
+    [[ $agent != grok ]] && run_packaged=1
+  done
+fi
+
+status=0
+if ((run_packaged)); then
+  /usr/share/omarchy/bin/omarchy-agent-usage-update "$@" || status=1
+fi
+
+if ((want_grok)); then
+  if ! record=$("$PLUGIN_DIR/omarchy-agent-usage-grok" "${flags[@]}") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+    echo "omarchy-agent-usage-update: grok collector failed" >&2
+    status=1
+  else
+    tmp=$(mktemp "$USAGE_DIR/.grok.XXXXXX")
+    printf '%s\n' "$record" >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$USAGE_DIR/grok.json"
+  fi
+fi
+
+exit "$status"
