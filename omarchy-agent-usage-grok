@@ -2,7 +2,9 @@
 """Collect Grok Build usage into one display-ready JSON record.
 
 Local stats come from $GROK_HOME/sessions (default ~/.grok/sessions). Each
-updates.jsonl turn_completed event is one billed prompt. SuperGrok weekly
+updates.jsonl turn_completed event is one billed prompt. A still-running
+turn is counted from its latest `_meta.totalTokens` until that billed
+event lands, so an open session is not stuck at zero. SuperGrok weekly
 usage, Grok Build product usage, leftover prepaid credits, and the plan
 label come from cli-chat-proxy /v1/billing and /v1/settings. The agents
 panel only ever reads the JSON this prints; the access token never leaves
@@ -32,7 +34,7 @@ AUTH_HELP = "Run `grok login` to sign in."
 DEFAULT_PROXY = "https://cli-chat-proxy.grok.com/v1"
 SCAN_REUSE_SECONDS = 20
 LIMITS_ONLY_REUSE_SECONDS = 900
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2
 PROBE_MIN_INTERVAL_SECONDS = 15
 
 
@@ -131,6 +133,11 @@ def session_kind(session_dir: Path) -> str:
   return str(summary.get("session_kind") or "")
 
 
+def session_model(session_dir: Path) -> str:
+  summary = read_json(session_dir / "summary.json") or {}
+  return str(summary.get("current_model_id") or "grok")
+
+
 def is_subagent(kind: str) -> bool:
   # Parent turn_completed already includes finished child spend.
   return kind.startswith("subagent")
@@ -177,13 +184,41 @@ def extract_usage(update: dict[str, Any]) -> dict[str, Any] | None:
   return None
 
 
-def scan_updates(path: Path) -> list[dict[str, Any]]:
+def billed_turns(path: Path, line_number: int, entry: dict[str, Any], update: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]]:
+  usage = extract_usage(update)
+  if usage is None:
+    return []
+  prompt_id = str(update.get("prompt_id") or update.get("promptId") or meta.get("promptId") or f"{path}:{line_number}")
+  fallback_model = str(update.get("model") or meta.get("modelId") or "grok")
+  day = local_date_from_timestamp(entry.get("timestamp") or meta.get("agentTimestampMs"))
+  out: list[dict[str, Any]] = []
+  for name, bucket in model_turns(usage):
+    input_tokens, output_tokens, cache_read, cache_write = turn_usage(bucket)
+    if not (input_tokens or output_tokens or cache_read or cache_write):
+      continue
+    out.append({
+      "id": prompt_id,
+      "day": day,
+      "model": str(name if name and name != "grok" else fallback_model),
+      "inputTokens": input_tokens,
+      "outputTokens": output_tokens,
+      "cacheReadInputTokens": cache_read,
+      "cacheCreationInputTokens": cache_write,
+    })
+  return out
+
+
+def scan_updates(path: Path, fallback_model: str = "grok") -> list[dict[str, Any]]:
   turns: list[dict[str, Any]] = []
   seen: set[str] = set()
+  # Open prompts have no billed ledger yet. Track the latest context size
+  # per prompt so a session still in flight is not reported as zero.
+  live: dict[str, dict[str, Any]] = {}
+  billed_model = fallback_model or "grok"
   try:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
       for line_number, line in enumerate(handle, 1):
-        if "turn_completed" not in line:
+        if "turn_completed" not in line and "totalTokens" not in line:
           continue
         try:
           entry = json.loads(line)
@@ -197,34 +232,41 @@ def scan_updates(path: Path) -> list[dict[str, Any]]:
         update = params.get("update") or {}
         if not isinstance(update, dict):
           continue
-        kind = update.get("sessionUpdate") or update.get("event_name")
-        if kind != "turn_completed":
-          continue
-        usage = extract_usage(update)
-        if usage is None:
-          continue
-        prompt_id = str(update.get("prompt_id") or update.get("promptId") or f"{path}:{line_number}")
-        if prompt_id in seen:
-          continue
-        seen.add(prompt_id)
         meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-        model = str(update.get("model") or meta.get("modelId") or "grok")
-        day = local_date_from_timestamp(entry.get("timestamp") or meta.get("agentTimestampMs"))
-        for model_name, bucket in model_turns(usage):
-          input_tokens, output_tokens, cache_read, cache_write = turn_usage(bucket)
-          if not (input_tokens or output_tokens or cache_read or cache_write):
-            continue
-          turns.append({
-            "id": prompt_id,
-            "day": day,
-            "model": str(model_name if model_name != "grok" else model),
-            "inputTokens": input_tokens,
-            "outputTokens": output_tokens,
-            "cacheReadInputTokens": cache_read,
-            "cacheCreationInputTokens": cache_write,
-          })
+        kind = update.get("sessionUpdate") or update.get("event_name")
+
+        if kind == "turn_completed":
+          billed = billed_turns(path, line_number, entry, update, meta)
+          if billed:
+            prompt_id = str(billed[0]["id"])
+            if prompt_id not in seen:
+              seen.add(prompt_id)
+              turns.extend(billed)
+              billed_model = str(billed[-1].get("model") or billed_model)
+          continue
+
+        tokens = number(meta.get("totalTokens"))
+        if tokens <= 0:
+          continue
+        prompt_id = str(meta.get("promptId") or update.get("prompt_id") or update.get("promptId") or "")
+        if not prompt_id or prompt_id in seen:
+          continue
+        live[prompt_id] = {
+          "id": prompt_id,
+          "day": local_date_from_timestamp(entry.get("timestamp") or meta.get("agentTimestampMs")),
+          "model": str(meta.get("modelId") or update.get("model") or billed_model or "grok"),
+          "inputTokens": tokens,
+          "outputTokens": 0,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+        }
   except OSError as exc:
     print(f"Ignoring unreadable Grok updates file {path}: {exc}", file=sys.stderr)
+    return turns
+
+  for prompt_id, turn in live.items():
+    if prompt_id not in seen:
+      turns.append(turn)
   return turns
 
 
@@ -299,7 +341,7 @@ def scan_sessions(sessions_root: Path) -> dict[str, Any]:
     session_dir = path.parent
     if is_subagent(session_kind(session_dir)):
       continue
-    accumulate(stats, scan_updates(path), session_dir.name)
+    accumulate(stats, scan_updates(path, session_model(session_dir)), session_dir.name)
   return stats
 
 
@@ -452,6 +494,18 @@ def scan_cache_paths(sessions_root: Path) -> tuple[Path, Path]:
   return root / f"grok-scan-{digest}.json", root / f"grok-scan-{digest}.lock"
 
 
+def sessions_source_mtime(sessions_root: Path) -> float:
+  latest = 0.0
+  if not sessions_root.is_dir():
+    return latest
+  for path in sessions_root.rglob("updates.jsonl"):
+    try:
+      latest = max(latest, path.stat().st_mtime)
+    except OSError:
+      continue
+  return latest
+
+
 def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
   if max_age_seconds <= 0 or not path.exists():
     return None
@@ -463,6 +517,24 @@ def read_fresh_json(path: Path, max_age_seconds: float) -> dict[str, Any] | None
   except Exception:
     return None
   return None
+
+
+def read_cached_scan(cache_file: Path, max_age_seconds: float, source_mtime: float) -> dict[str, Any] | None:
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if not cached or cached.get("schemaVersion") != CACHE_SCHEMA:
+    return None
+  if cached.get("scanDate") != date_string():
+    return None
+  # Opening the panel uses --limits-only, which reuses a scan for 15 minutes.
+  # That must not keep an empty snapshot after Grok has since written turns.
+  try:
+    cached_mtime = float(cached.get("sourceMtime") or 0)
+  except (TypeError, ValueError):
+    return None
+  if cached_mtime < source_mtime:
+    return None
+  stats = cached.get("stats")
+  return stats if isinstance(stats, dict) else None
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -480,19 +552,16 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def cached_scan(sessions_root: Path, max_age_seconds: float) -> dict[str, Any]:
   cache_file, lock_file = scan_cache_paths(sessions_root)
-  cached = read_fresh_json(cache_file, max_age_seconds)
-  if cached and cached.get("schemaVersion") == CACHE_SCHEMA and cached.get("scanDate") == date_string():
-    stats = cached.get("stats")
-    if isinstance(stats, dict):
-      return stats
+  source_mtime = sessions_source_mtime(sessions_root)
+  cached = read_cached_scan(cache_file, max_age_seconds, source_mtime)
+  if cached is not None:
+    return cached
 
   with lock_file.open("w") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    cached = read_fresh_json(cache_file, max_age_seconds)
-    if cached and cached.get("schemaVersion") == CACHE_SCHEMA and cached.get("scanDate") == date_string():
-      stats = cached.get("stats")
-      if isinstance(stats, dict):
-        return stats
+    cached = read_cached_scan(cache_file, max_age_seconds, source_mtime)
+    if cached is not None:
+      return cached
     summary = scan_sessions(sessions_root)
     extra = scan_pi_sessions()
     if extra is not None:
@@ -501,7 +570,12 @@ def cached_scan(sessions_root: Path, max_age_seconds: float) -> dict[str, Any]:
     if extra is not None:
       summary = merge_stats(summary, extra)
     try:
-      write_json(cache_file, {"schemaVersion": CACHE_SCHEMA, "scanDate": date_string(), "stats": summary})
+      write_json(cache_file, {
+        "schemaVersion": CACHE_SCHEMA,
+        "scanDate": date_string(),
+        "sourceMtime": sessions_source_mtime(sessions_root),
+        "stats": summary,
+      })
     except Exception as exc:
       print(f"omarchy-agent-usage-grok: could not write usage cache ({exc})", file=sys.stderr)
     return summary

@@ -75,6 +75,54 @@ class ScanUpdatesTests(unittest.TestCase):
       self.assertEqual(stats["modelUsage"]["grok-4.6-build"]["cacheReadInputTokens"], 20)
       self.assertEqual(stats["modelUsage"]["grok-4.6-build"]["outputTokens"], 10)
 
+  def test_counts_in_progress_context_until_turn_completes(self) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+      root = Path(raw) / "session"
+      root.mkdir()
+      (root / "summary.json").write_text("{}", encoding="utf-8")
+      open_turn = {
+        "timestamp": "2026-08-28T12:00:00Z",
+        "params": {
+          "update": {"sessionUpdate": "agent_message_chunk"},
+          "_meta": {"promptId": "live", "totalTokens": 12345, "modelId": "grok-4.6-build"},
+        },
+      }
+      (root / "updates.jsonl").write_text(json.dumps(open_turn) + "\n", encoding="utf-8")
+      stats = mod.scan_sessions(root.parent)
+      self.assertEqual(stats["totalPrompts"], 1)
+      self.assertEqual(stats["modelUsage"]["grok-4.6-build"]["inputTokens"], 12345)
+
+  def test_completed_turn_replaces_in_progress_estimate(self) -> None:
+    with tempfile.TemporaryDirectory() as raw:
+      root = Path(raw) / "session"
+      root.mkdir()
+      (root / "summary.json").write_text("{}", encoding="utf-8")
+      lines = [
+        {
+          "timestamp": "2026-08-28T12:00:00Z",
+          "params": {
+            "update": {"sessionUpdate": "agent_message_chunk"},
+            "_meta": {"promptId": "p1", "totalTokens": 99999, "modelId": "grok-4.6-build"},
+          },
+        },
+        {
+          "timestamp": "2026-08-28T12:01:00Z",
+          "params": {
+            "update": {
+              "sessionUpdate": "turn_completed",
+              "prompt_id": "p1",
+              "model": "grok-4.6-build",
+              "usage": {"inputTokens": 50, "outputTokens": 10, "cachedReadTokens": 0},
+            },
+          },
+        },
+      ]
+      (root / "updates.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+      stats = mod.scan_sessions(root.parent)
+      self.assertEqual(stats["totalPrompts"], 1)
+      self.assertEqual(stats["modelUsage"]["grok-4.6-build"]["inputTokens"], 50)
+      self.assertEqual(stats["modelUsage"]["grok-4.6-build"]["outputTokens"], 10)
+
 
 class BillingParseTests(unittest.TestCase):
   def test_weekly_and_build_skip_voice(self) -> None:
